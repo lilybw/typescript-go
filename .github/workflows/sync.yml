@@ -31,12 +31,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out this fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fork
 
       - name: Check out upstream
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: microsoft/typescript-go
           ref: ${{ inputs.ref || 'main' }}
@@ -50,7 +50,7 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: upstream/go.mod
 
