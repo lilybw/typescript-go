@@ -1,0 +1,129 @@
+# Re-export the TypeScript compiler's internals under a public import path.
+#
+# Upstream keeps everything under internal/, which Go forbids other modules
+# from importing. This job pulls upstream, runs sync.go to relocate those
+# packages, verifies the result actually builds, and commits.
+#
+# The build check is the important part: a sync that silently drops embedded
+# assets produces a module that resolves but does not compile, and the failure
+# then lands on every downstream consumer rather than here.
+
+name: sync
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream ref to sync (branch, tag, or SHA)"
+        default: "main"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this fork
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Check out upstream
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/typescript-go
+          ref: ${{ inputs.ref || 'main' }}
+          path: upstream
+          fetch-depth: 1
+
+      - name: Record the upstream commit
+        id: upstream
+        working-directory: upstream
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/go.mod
+
+      - name: Replace the working tree with upstream, keeping fork-owned files
+        run: |
+          cd fork
+          # Everything except our own tooling and git metadata is regenerated,
+          # so a file deleted upstream disappears here too.
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name .git \
+            ! -name .github \
+            ! -name sync.go \
+            ! -name README.fork.md \
+            -exec rm -rf {} +
+          cp -a ../upstream/. .
+          rm -rf .git-upstream
+          # cp -a brought upstream's .github with it; ours is authoritative.
+          git checkout -- .github 2>/dev/null || true
+
+      - name: Point go.mod at this fork
+        working-directory: fork
+        run: |
+          sed -i "s|^module .*|module github.com/${{ github.repository }}|" go.mod
+          head -1 go.mod
+
+      - name: Re-export internals
+        working-directory: fork
+        run: go run sync.go
+
+      - name: Verify the re-exported packages build
+        working-directory: fork
+        # Building the packages consumers actually import is what catches a
+        # dropped embed. ./... would also try cmd/ and the tooling, which can
+        # fail for unrelated reasons and would mask this.
+        run: |
+          go build ./use-at-your-own-risk/parser/... \
+                   ./use-at-your-own-risk/printer/... \
+                   ./use-at-your-own-risk/ast/... \
+                   ./use-at-your-own-risk/transformers/...
+
+      - name: Verify the tree was pruned
+        working-directory: fork
+        # A sync that stops pruning would put 85 MB of upstream test baselines
+        # into every consumer's module cache.
+        run: |
+          count=$(git ls-files | wc -l)
+          echo "tracked files: $count"
+          if [ "$count" -gt 2000 ]; then
+            echo "::error::$count tracked files; expected ~650. Pruning did not run."
+            exit 1
+          fi
+
+      - name: Verify the locale assets survived
+        working-directory: fork
+        run: |
+          count=$(find use-at-your-own-risk/diagnostics/loc -name '*.json.gz' 2>/dev/null | wc -l)
+          echo "locale assets: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no locale assets were copied; downstream builds would fail"
+            exit 1
+          fi
+
+      - name: Commit
+        working-directory: fork
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "already in sync with upstream ${{ steps.upstream.outputs.short }}"
+            exit 0
+          fi
+          git commit -m "Sync with microsoft/typescript-go@${{ steps.upstream.outputs.short }}
+
+          Upstream: https://github.com/microsoft/typescript-go/commit/${{ steps.upstream.outputs.sha }}"
+          git push
